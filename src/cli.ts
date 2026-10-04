@@ -21,7 +21,7 @@
 
 import process from "node:process";
 import { AXOVB_VERSION, AXOVB_VERSION_SEMVER } from "./version.js";
-import { checkBumpNeeded, performBump } from "./bumper.js";
+import { checkBumpNeeded, performBump, type BumpOptions } from "./bumper.js";
 
 const HELP = `
   AXOVB  ${AXOVB_VERSION}  — Axo Version Bumper
@@ -42,11 +42,30 @@ const HELP = `
     Set AXOVB_LICENSE_KEY env var to activate.
     Without a key, runs in free-tier mode (limited to 10 checks/day).
 
+  LLM CONFIGURATION
+    --provider <p>    Provider: lmstudio, ollama, openai, groq, etc.
+    --url <url>       Base URL (default: http://localhost:1234/v1)
+    --model <model>   Model name (default: qwen2.5-coder-7b-instruct)
+    --api-key <key>   API key (for cloud providers)
+
+    Or set env vars: AXOVB_BASE_URL, AXOVB_MODEL, AXOVB_API_KEY
+
   FRAZIYM VERSIONING
     Supports both semver (0.1.0) and FRAZIYM (V00.01.000) formats.
     Detects the format from the existing version string and bumps
     accordingly.
 `;
+
+function parseProviderOpts(args: string[]): BumpOptions {
+  const opts: BumpOptions = {};
+  for (let i = 0; i < args.length; i++) {
+    if (args[i] === "--provider" && args[i + 1]) opts.provider = args[++i];
+    if (args[i] === "--url" && args[i + 1]) opts.baseUrl = args[++i];
+    if (args[i] === "--model" && args[i + 1]) opts.model = args[++i];
+    if (args[i] === "--api-key" && args[i + 1]) opts.apiKey = args[++i];
+  }
+  return opts;
+}
 
 async function main(): Promise<void> {
   const args = process.argv.slice(2);
@@ -64,20 +83,21 @@ async function main(): Promise<void> {
 
   switch (cmd) {
     case "check": {
-      const result = await checkBumpNeeded(process.cwd());
+      const result = await checkBumpNeeded(process.cwd(), parseProviderOpts(args));
       if (result.needed) {
         console.log(`\n  [!] Version bump needed: ${result.reason}`);
         console.log(`      Current: ${result.currentVersion}`);
         console.log(`      Suggested: ${result.suggestedVersion}`);
-        console.log(`      Bump type: ${result.bumpType}\n`);
-        process.exitCode = 1; // Non-zero so CI can detect
+        console.log(`      Bump type: ${result.bumpType}`);
+        if (result.llmAnalysis) console.log(`      LLM: ${result.llmAnalysis.slice(0, 200)}\n`);
+        process.exitCode = 1;
       } else {
         console.log(`\n  [+] Version is up to date (${result.currentVersion})\n`);
       }
       break;
     }
     case "bump": {
-      const result = await checkBumpNeeded(process.cwd());
+      const result = await checkBumpNeeded(process.cwd(), parseProviderOpts(args));
       if (!result.needed) {
         console.log(`\n  [+] No bump needed. Current: ${result.currentVersion}\n`);
         return;
