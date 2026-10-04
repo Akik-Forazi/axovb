@@ -1,6 +1,6 @@
 {
   "name": "@fraziym/axovb",
-  "version": "0.1.1-beta.2",
+  "version": "0.1.2-beta.3",
   "description": "Axo Version Bumper — small LLM that detects forgotten version bumps and does them automatically. Works with any coding agent. $0.90/mo.",
   "author": "Akik Faraji <akikfaraji@gmail.com>",
   "license": "MIT",
@@ -44,7 +44,8 @@
     "node": ">=20.11"
   },
   "dependencies": {
-    "simple-git": "^3.27.0"
+    "@huggingface/transformers": "^4.1.0",
+    "onnxruntime-node": "^1.20.0"
   },
   "devDependencies": {
     "@types/node": "^22.0.0",

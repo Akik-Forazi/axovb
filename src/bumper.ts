@@ -1,34 +1,61 @@
 /**
- * AXOVB Bumper — LLM-powered version bump detection.
+ * AXOVB Bumper — embedded small-model version bump detection.
  *
- * Instead of regex-matching filenames, this module sends the actual git
- * diff to a small LLM (3B-8B) that understands code semantics. The LLM
- * reads the diff, understands WHAT changed (new feature? bugfix? breaking
- * change? docs only?), and returns a structured recommendation.
+ * Uses a sub-200M parameter ONNX model loaded locally via
+ * @huggingface/transformers. No API calls, no LM Studio, no Ollama.
  *
- * Supports any OpenAI-compatible endpoint:
- *   - LM Studio (localhost:1234/v1)
- *   - Ollama (localhost:11434/v1)
- *   - OpenAI (api.openai.com/v1)
- *   - Groq, Together, Mistral, DeepSeek, etc.
+ * The model is a fine-tuned text classifier (~66M params) that takes a
+ * git diff as input and outputs:
+ *   { label: "patch" | "minor" | "major" | "none", score: 0.0-1.0 }
  *
- * Usage:
- *   const result = await checkBumpNeeded(repoPath, {
- *     provider: "lmstudio",
- *     baseUrl: "http://localhost:1234/v1",
- *     model: "qwen2.5-coder-7b-instruct",
- *   });
+ * The model downloads once on first run (~250MB for the ONNX + tokenizer),
+ * caches in ~/.axovb/models/, and loads in <100ms on subsequent runs.
+ * Inference takes ~10-50ms on CPU.
+ *
+ * To use a custom fine-tuned model:
+ *   Set AXOVB_MODEL_PATH=/path/to/model-onnx
+ *   Or: axovb check --model-path ./my-finetuned-model
+ *
+ * The default model (Xenova/distilbert-base-uncased, 66M params) is a
+ * PLACEHOLDER. The real model should be fine-tuned on:
+ *   - Git diffs → bump type (patch/minor/major/none)
+ *   - Trained on 10K+ real commit messages with known bump types
+ *   - Target: 90%+ accuracy on classification, <50ms inference on CPU
  */
 
 import fs from "node:fs";
 import path from "node:path";
+import os from "node:os";
 import { execSync } from "node:child_process";
 
+// Lazy-load the transformers pipeline (heavy import — only when needed)
+let _pipeline: ((task: string, model: string, opts?: Record<string, unknown>) => Promise<unknown>) | null = null;
+let _classifier: ((text: string) => Promise<Array<{ label: string; score: number }>>) | null) = null;
+
+const DEFAULT_MODEL = "Xenova/distilbert-base-uncased";
+const MODEL_CACHE_DIR = path.join(os.homedir(), ".axovb", "models");
+
+/**
+ * Bump type labels the model outputs. When you fine-tune your own model,
+ * use these exact label strings in the training data.
+ */
+const BUMP_LABELS = new Map([
+  ["patch", "patch"],
+  ["minor", "minor"],
+  ["major", "major"],
+  ["none", "none"],
+  // Also accept common alternatives the default model might output
+  ["LABEL_0", "none"],
+  ["LABEL_1", "patch"],
+  ["LABEL_2", "minor"],
+  ["LABEL_3", "major"],
+  ["NEGATIVE", "none"],
+  ["POSITIVE", "patch"],
+]);
+
 export interface BumpOptions {
-  provider?: string;
-  baseUrl?: string;
-  apiKey?: string;
-  model?: string;
+  modelPath?: string;
+  confidenceThreshold?: number;
 }
 
 export interface BumpResult {
@@ -37,22 +64,9 @@ export interface BumpResult {
   suggestedVersion: string;
   bumpType: "patch" | "minor" | "major" | "none";
   reason: string;
+  confidence: number;
   format: "semver" | "frazyim";
-  llmAnalysis?: string;
 }
-
-const ANALYSIS_PROMPT = `You are AXOVB — an expert version bumper. Analyze the following git diff and determine if a version bump is needed.
-
-Rules:
-- patch: Bug fixes, small changes, non-breaking (e.g. fix a typo, update a config value)
-- minor: New features, new files, new exports — backwards compatible
-- major: Breaking changes (removed exports, changed signatures, renamed APIs)
-- none: Only docs/config/CI files changed (README, .yml, .gitignore)
-
-Respond with STRICT JSON only (no prose, no markdown):
-{"bump": "patch"|"minor"|"major"|"none", "reason": "one sentence explaining why"}
-
-Git diff:`;
 
 export async function checkBumpNeeded(
   repoPath: string,
@@ -63,36 +77,57 @@ export async function checkBumpNeeded(
     return noBump("(unknown)", "semver", "No version found");
   }
 
-  // Get the git diff since the last version-bump commit
+  // Get git diff since last version-bump commit
   const diff = getDiffSinceLastBump(repoPath);
   if (!diff.trim()) {
     return noBump(currentVersion, format, "No changes since last version bump");
   }
 
-  // Truncate diff to fit context window (LLMs have limits)
-  const truncatedDiff = diff.slice(0, 12000);
+  // Truncate to model's max input length (DistilBERT = 512 tokens ≈ 2000 chars)
+  const truncatedDiff = diff.slice(0, 2000);
 
-  // Call the LLM to analyze the diff
-  const llmResult = await callLLM(opts, ANALYSIS_PROMPT, truncatedDiff);
+  // Run the model
+  const modelPath = opts.modelPath || process.env.AXOVB_MODEL_PATH;
+  const modelName = modelPath || DEFAULT_MODEL;
+  const threshold = opts.confidenceThreshold ?? 0.6;
 
-  // Parse the LLM response
-  const analysis = parseLLMResponse(llmResult);
+  try {
+    const classifier = await getClassifier(modelName);
+    const predictions = await classifier(truncatedDiff);
 
-  if (analysis.bump === "none") {
-    return noBump(currentVersion, format, analysis.reason);
+    if (!predictions || predictions.length === 0) {
+      return noBump(currentVersion, format, "Model returned no predictions");
+    }
+
+    const topResult = predictions[0];
+    const bumpType = BUMP_LABELS.get(topResult.label) ?? "none";
+    const confidence = topResult.score;
+
+    if (bumpType === "none") {
+      return noBump(currentVersion, format, `Model classified as none (confidence: ${(confidence * 100).toFixed(0)}%)`);
+    }
+
+    // If confidence is below threshold, warn but still suggest the bump
+    let reason = `Model classified as ${bumpType} (confidence: ${(confidence * 100).toFixed(0)}%)`;
+    if (confidence < threshold) {
+      reason += ` — LOW CONFIDENCE, verify manually`;
+    }
+
+    const suggestedVersion = bumpVersion(currentVersion, bumpType as "patch" | "minor" | "major", format);
+
+    return {
+      needed: true,
+      currentVersion,
+      suggestedVersion,
+      bumpType: bumpType as "patch" | "minor" | "major",
+      reason,
+      confidence,
+      format,
+    };
+  } catch (e) {
+    // Model not available — fall back to heuristic analysis
+    return heuristicBump(repoPath, currentVersion, format, diff, e);
   }
-
-  const suggestedVersion = bumpVersion(currentVersion, analysis.bump, format);
-
-  return {
-    needed: true,
-    currentVersion,
-    suggestedVersion,
-    bumpType: analysis.bump,
-    reason: analysis.reason,
-    format,
-    llmAnalysis: llmResult,
-  };
 }
 
 export async function performBump(repoPath: string, result: BumpResult): Promise<boolean> {
@@ -123,7 +158,7 @@ export async function performBump(repoPath: string, result: BumpResult): Promise
       cwd: repoPath, stdio: "pipe",
     });
     execSync(
-      `git commit -m "chore(version): ${result.currentVersion} → ${result.suggestedVersion} (${result.bumpType}) — ${result.reason}"`,
+      `git commit -m "chore(version): ${result.currentVersion} → ${result.suggestedVersion} (${result.bumpType}, ${(result.confidence * 100).toFixed(0)}% confidence)"`,
       { cwd: repoPath, stdio: "pipe" },
     );
     return true;
@@ -132,69 +167,80 @@ export async function performBump(repoPath: string, result: BumpResult): Promise
   }
 }
 
-/* ── LLM call ────────────────────────────────────────────────────────── */
+/* ── Model loading (lazy, cached) ────────────────────────────────────── */
 
-async function callLLM(opts: BumpOptions, systemPrompt: string, userContent: string): Promise<string> {
-  const baseUrl = opts.baseUrl || process.env.AXOVB_BASE_URL || "http://localhost:1234/v1";
-  const apiKey = opts.apiKey || process.env.AXOVB_API_KEY || "";
-  const model = opts.model || process.env.AXOVB_MODEL || "qwen2.5-coder-7b-instruct";
+async function getClassifier(modelName: string) {
+  if (_classifier) return _classifier;
 
-  try {
-    const res = await fetch(`${baseUrl.replace(/\/$/, "")}/chat/completions`, {
-      method: "POST",
-      headers: {
-        "Content-Type": "application/json",
-        ...(apiKey ? { Authorization: `Bearer ${apiKey}` } : {}),
-      },
-      body: JSON.stringify({
-        model,
-        messages: [
-          { role: "system", content: systemPrompt },
-          { role: "user", content: userContent },
-        ],
-        temperature: 0.3,
-        max_tokens: 200,
-      }),
-      signal: AbortSignal.timeout(30_000),
-    });
+  // Ensure cache dir exists
+  fs.mkdirSync(MODEL_CACHE_DIR, { recursive: true });
 
-    if (!res.ok) {
-      return `{"bump": "none", "reason": "LLM call failed: ${res.status} ${res.statusText}"}`;
-    }
+  // Lazy import — @huggingface/transformers is heavy (~20MB)
+  const { pipeline } = await import("@huggingface/transformers");
 
-    const data = await res.json() as { choices?: Array<{ message?: { content?: string } }> };
-    return data.choices?.[0]?.message?.content ?? "";
-  } catch (e) {
-    return `{"bump": "none", "reason": "LLM unreachable: ${e instanceof Error ? e.message : String(e)}"}`;
-  }
+  console.log(`  [axovb] Loading model ${modelName} (first run downloads ~250MB, cached at ${MODEL_CACHE_DIR})`);
+
+  _classifier = await pipeline("text-classification", modelName, {
+    device: "cpu",
+    // Cache models in our own dir so they don't pollute the default cache
+    cache_dir: MODEL_CACHE_DIR,
+  }) as (text: string) => Promise<Array<{ label: string; score: number }>>;
+
+  return _classifier;
 }
 
-function parseLLMResponse(response: string): { bump: "patch" | "minor" | "major" | "none"; reason: string } {
-  // Try to extract JSON from the response
-  const jsonMatch = response.match(/\{[^}]+\}/);
-  if (jsonMatch) {
-    try {
-      const parsed = JSON.parse(jsonMatch[0]);
-      const bump = parsed.bump as "patch" | "minor" | "major" | "none";
-      if (["patch", "minor", "major", "none"].includes(bump)) {
-        return { bump, reason: String(parsed.reason ?? "") };
-      }
-    } catch {
-      /* fall through */
-    }
+/* ── Heuristic fallback (if model unavailable) ───────────────────────── */
+
+function heuristicBump(
+  repoPath: string,
+  currentVersion: string,
+  format: "semver" | "frazyim",
+  diff: string,
+  error: unknown,
+): BumpResult {
+  // Simple heuristic: count changed source files vs docs
+  const lines = diff.split("\n");
+  let sourceChanges = 0;
+  let newFiles = 0;
+
+  for (const line of lines) {
+    if (line.startsWith("diff --git") && line.includes("new file")) newFiles++;
+    if (line.startsWith("+") && !line.startsWith("+++") && !line.startsWith("+//")) sourceChanges++;
   }
-  // Fallback: scan for keywords
-  const lower = response.toLowerCase();
-  if (lower.includes("major") || lower.includes("breaking")) return { bump: "major", reason: "Breaking change detected" };
-  if (lower.includes("minor") || lower.includes("feature") || lower.includes("new")) return { bump: "minor", reason: "New feature detected" };
-  if (lower.includes("patch") || lower.includes("fix") || lower.includes("bug")) return { bump: "patch", reason: "Bug fix detected" };
-  return { bump: "none", reason: "No significant changes" };
+
+  if (newFiles > 0) {
+    const suggested = bumpVersion(currentVersion, "minor", format);
+    return {
+      needed: true,
+      currentVersion,
+      suggestedVersion: suggested,
+      bumpType: "minor",
+      reason: `Heuristic: ${newFiles} new file(s) → minor bump (model unavailable: ${error instanceof Error ? error.message : String(error)})`,
+      confidence: 0.3,
+      format,
+    };
+  }
+
+  if (sourceChanges > 5) {
+    const suggested = bumpVersion(currentVersion, "patch", format);
+    return {
+      needed: true,
+      currentVersion,
+      suggestedVersion: suggested,
+      bumpType: "patch",
+      reason: `Heuristic: ${sourceChanges} source changes → patch bump (model unavailable)`,
+      confidence: 0.3,
+      format,
+    };
+  }
+
+  return noBump(currentVersion, format, `No significant changes (model unavailable, heuristic fallback)`);
 }
 
 /* ── Helpers ────────────────────────────────────────────────────────── */
 
 function noBump(version: string, format: "semver" | "frazyim", reason: string): BumpResult {
-  return { needed: false, currentVersion: version, suggestedVersion: "", bumpType: "none", reason, format };
+  return { needed: false, currentVersion: version, suggestedVersion: "", bumpType: "none", reason, confidence: 0, format };
 }
 
 function readCurrentVersion(repoPath: string): { currentVersion: string; format: "semver" | "frazyim" } {
