@@ -12,7 +12,8 @@
  *   axovb --version                Print version
  *   axovb --help                   Show help
  *
- * The model downloads on first run (~250MB, cached at ~/.axovb/models/).
+ * The model downloads on first run (~250MB, cached in the machine-local FRAZIYM
+ * cache — %LOCALAPPDATA%\FRAZIYM\axovb\models on Windows).
  * To use a custom fine-tuned model:
  *   axovb check --model-path /path/to/my-finetuned-onnx
  *   Or: AXOVB_MODEL_PATH=/path/to/model axovb check
@@ -40,7 +41,7 @@ const HELP = `
 
   MODEL
     Default: Xenova/distilbert-base-uncased (66M params)
-    Cache:   ~/.axovb/models/
+    Cache:   %LOCALAPPDATA%\FRAZIYM\axovb\models\ (Windows; $FRAZIYM_LOCAL overrides)
     Custom:  --model-path /path/to/fine-tuned-onnx
              or AXOVB_MODEL_PATH env var
 

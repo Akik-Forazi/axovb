@@ -25,13 +25,20 @@ import path from "node:path";
 import os from "node:os";
 import { execSync } from "node:child_process";
 
-/** Shared Fraziym root — one dir for every Fraziym product (~/.fraziym, override: $FRAZIYM_HOME). */
-function fraziymRoot(): string {
-  const override = process.env.FRAZIYM_HOME?.trim();
-  return override ? path.resolve(override) : path.join(os.homedir(), ".fraziym");
+/** Machine-local Fraziym cache root — caches that never roam (T2; override: $FRAZIYM_LOCAL). */
+function fraziymLocal(): string {
+  const override = process.env.FRAZIYM_LOCAL?.trim();
+  if (override) return path.resolve(override);
+  if (process.platform === "win32") {
+    const base = process.env.LOCALAPPDATA?.trim() || path.join(os.homedir(), "AppData", "Local");
+    return path.join(base, "FRAZIYM");
+  }
+  if (process.platform === "darwin") return path.join(os.homedir(), "Library", "Caches", "FRAZIYM");
+  const xdg = process.env.XDG_CACHE_HOME?.trim();
+  return path.join(xdg || path.join(os.homedir(), ".cache"), "fraziym");
 }
 
-const MODEL_CACHE_DIR = path.join(fraziymRoot(), "axovb", "models");
+const MODEL_CACHE_DIR = path.join(fraziymLocal(), "axovb", "models");
 const DEFAULT_MODEL = "Xenova/distilbert-base-uncased";
 
 let _classifier: ((text: string) => Promise<Array<{ label: string; score: number }>>) | null = null;
