@@ -25,7 +25,13 @@ import path from "node:path";
 import os from "node:os";
 import { execSync } from "node:child_process";
 
-const MODEL_CACHE_DIR = path.join(os.homedir(), ".axovb", "models");
+/** Shared Fraziym root — one dir for every Fraziym product (~/.fraziym, override: $FRAZIYM_HOME). */
+function fraziymRoot(): string {
+  const override = process.env.FRAZIYM_HOME?.trim();
+  return override ? path.resolve(override) : path.join(os.homedir(), ".fraziym");
+}
+
+const MODEL_CACHE_DIR = path.join(fraziymRoot(), "axovb", "models");
 const DEFAULT_MODEL = "Xenova/distilbert-base-uncased";
 
 let _classifier: ((text: string) => Promise<Array<{ label: string; score: number }>>) | null = null;
@@ -327,14 +333,15 @@ function readCurrentVersion(repoPath: string): { currentVersion: string; format:
 }
 
 function toSemver(frazyim: string): string {
-  const m = fraziym.match(/^V(\d{2})\.(\d{2})\.(\d{3})(?:-(alpha|beta|rc)(?:-(\d{2}))?)?$/);
-  if (!m) return fraziym;
+  const m = frazyim.match(/^V(\d{2})\.(\d{2})\.(\d{3})(?:-(alpha|beta|rc)(?:-(\d{2}))?)?$/);
+  if (!m) return frazyim;
   let s = `${Number(m[1])}.${Number(m[2])}.${Number(m[3])}`;
   if (m[4]) { s += `-${m[4]}`; if (m[5]) s += `.${Number(m[5])}`; }
   return s;
 }
 
-function bumpVersion(current: string, bumpType: "patch" | "minor" | "major", format: "semver" | "frazyim"): string {
+function bumpVersion(current: string, bumpType: "patch" | "minor" | "major" | "none", format: "semver" | "frazyim"): string {
+  if (bumpType === "none") return current;
   if (format === "frazyim") return bumpFraziym(current, bumpType);
   return bumpSemver(current, bumpType);
 }
